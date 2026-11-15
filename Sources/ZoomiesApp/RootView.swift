@@ -568,7 +568,12 @@ struct ActiveProfileStrip: View {
             Image(systemName: "bolt.fill").font(.system(size: 10)).foregroundStyle(Theme.accent)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Active: \(profile.config.label)").font(Theme.body).foregroundStyle(Theme.text)
-                Text(profile.headline).font(Theme.tiny).foregroundStyle(Theme.tertiary).lineLimit(1)
+                if profile.isStale(for: app.installation) {
+                    Text("Tuned on llama.cpp build \(profile.runtimeBuild.map(String.init) ?? "?"); build \(app.installation?.buildNumber.map(String.init) ?? "?") is installed. Re-tune to check it still wins.")
+                        .font(Theme.tiny).foregroundStyle(Theme.warn).lineLimit(1)
+                } else {
+                    Text(profile.headline).font(Theme.tiny).foregroundStyle(Theme.tertiary).lineLimit(1)
+                }
             }
             Spacer()
             PillButton(title: "Copy server command", icon: "doc.on.doc") {

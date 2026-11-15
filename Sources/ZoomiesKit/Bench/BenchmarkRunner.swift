@@ -1,6 +1,6 @@
 import Foundation
 
-public let zoomiesVersion = "0.2.0"
+public let zoomiesVersion = "0.2.1"
 
 public struct SafetyLimits: Codable, Sendable, Equatable {
     /// Benchmarks on battery are slower, noisier and drain it; off unless asked.

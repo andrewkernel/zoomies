@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 — 2026-11-14
+
+### Fixed
+- Exported and served `llama-server` commands used Homebrew's versioned path (`…/Cellar/llama.cpp/1.0.0/bin/…`), which disappears on `brew upgrade`. They now use the stable link (`/opt/homebrew/bin/llama-server`) whenever it points at the same binary.
+- Profiles now show the model's file name instead of the GGUF's internal name (e.g. "Qwen3-14B-Q4_K_M", not "Qwen3 14B Awq Compatible Instruct").
+
+### Added
+- Profiles tuned on a different llama.cpp build are flagged: `zoomies export/serve` print a warning with the re-tune command, `zoomies profiles` marks them, and the app shows a notice on the active profile and in the Profiles tab.
+
 ## 0.2.0 — 2026-11-14
 
 ### Added

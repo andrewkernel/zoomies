@@ -38,6 +38,14 @@ public struct TuningProfile: Codable, Sendable, Identifiable, Equatable, Hashabl
     }
 
     /// A profile from a finished tune (also for "keep defaults": that is a result worth recording).
+    /// True when the installed runtime is a different build from the one this
+    /// profile was measured on. Speed-optimal settings can change between
+    /// builds (defaults move, kernels change), so the profile should be re-tuned.
+    public func isStale(for installation: RuntimeInstallation?) -> Bool {
+        guard let mine = runtimeBuild, let now = installation?.buildNumber else { return false }
+        return mine != now
+    }
+
     public static func from(_ r: TuneReport, modelURL: URL) -> TuningProfile {
         let name: String
         switch r.decision.kind {
@@ -48,7 +56,8 @@ public struct TuningProfile: Codable, Sendable, Identifiable, Equatable, Hashabl
         if let p = r.decision.primary, let m = r.decision.primaryMetric, r.decision.kind == .improved {
             headline = "\(fmtComparison(p)) \(m)"
         }
-        return TuningProfile(name: name, modelPath: modelURL.path, modelName: r.model.name ?? modelURL.lastPathComponent,
+        let fileStem = (modelURL.lastPathComponent as NSString).deletingPathExtension
+        return TuningProfile(name: name, modelPath: modelURL.path, modelName: fileStem.hasPrefix("sha256-") ? (r.model.name ?? fileStem) : fileStem,
                              modelFingerprint: r.model.quickFingerprint, hardwareFingerprint: r.hardware.fingerprint,
                              runtimeBuild: r.installation.buildNumber, objective: r.request.objective,
                              config: r.decision.config, headline: headline, tuneRunID: r.id,
@@ -63,11 +72,30 @@ public struct TuningProfile: Codable, Sendable, Identifiable, Equatable, Hashabl
 /// are -1 (all) in llama-bench but `auto` (fit to memory) in llama-server.
 /// Those two are always written explicitly, so the server runs what was measured.
 public enum ServerCommand {
-    /// `llama-server` from the same installation as the measured llama-bench.
-    public static func executable(near benchPath: String) -> String {
+    /// `llama-server` from the same installation as the measured llama-bench,
+    /// spelled with a path that survives upgrades. Homebrew installs into a
+    /// versioned folder (`…/Cellar/llama.cpp/1.0.0/bin`) and links it from
+    /// `…/bin`; the versioned path disappears on `brew upgrade`, so the stable
+    /// link is used whenever it points at the same binary.
+    public static func executable(near benchPath: String, searchPath: String? = ProcessInfo.processInfo.environment["PATH"]) -> String {
+        let fm = FileManager.default
         let dir = (benchPath as NSString).deletingLastPathComponent
         let sibling = (dir as NSString).appendingPathComponent("llama-server")
-        return FileManager.default.isExecutableFile(atPath: sibling) ? sibling : "llama-server"
+        guard fm.isExecutableFile(atPath: sibling) else { return "llama-server" }
+        let target = URL(fileURLWithPath: sibling).resolvingSymlinksInPath().path
+        var stable: [String] = []
+        // …/Cellar/<formula>/<version>/bin/llama-server  →  …/bin/llama-server
+        if let r = sibling.range(of: #"/Cellar/[^/]+/[^/]+/bin/llama-server$"#, options: .regularExpression) {
+            stable.append(String(sibling[..<r.lowerBound]) + "/bin/llama-server")
+        }
+        for d in (searchPath ?? "").split(separator: ":") where !d.isEmpty && d != "." {
+            stable.append("\(d)/llama-server")
+        }
+        for c in stable where c != sibling && fm.isExecutableFile(atPath: c)
+            && URL(fileURLWithPath: c).resolvingSymlinksInPath().path == target {
+            return c
+        }
+        return sibling
     }
 
     public static func arguments(config c: InferenceConfig, modelPath: String, installation: RuntimeInstallation,

@@ -478,13 +478,15 @@ case "profiles":
         let list = try db.profiles(modelFingerprint: modelFP, hardwareFingerprint: hw.fingerprint)
         if asJSON { printJSON(list); break }
         if list.isEmpty { print("No profiles yet. Run `zoomies tune MODEL`."); break }
+        let currentInstall = try? LlamaBenchAdapter(explicitPath: option("--llama-bench")).discover()
         var active: [String: UUID?] = [:]
         for p in list where active[p.modelFingerprint] == nil {
             active[p.modelFingerprint] = try db.activeProfile(modelFingerprint: p.modelFingerprint, hardwareFingerprint: hw.fingerprint)?.id
         }
         for p in list {
             let mark = (active[p.modelFingerprint] ?? nil) == p.id ? "*" : " "
-            print("\(mark) \(p.id.uuidString.prefix(8))  \(p.modelName.padding(toLength: 28, withPad: " ", startingAt: 0))  \(p.config.label.padding(toLength: 24, withPad: " ", startingAt: 0))  \(p.headline)")
+            let stale = p.isStale(for: currentInstall) ? "  (tuned on build \(p.runtimeBuild.map(String.init) ?? "?"); re-tune)" : ""
+            print("\(mark) \(p.id.uuidString.prefix(8))  \(p.modelName.padding(toLength: 28, withPad: " ", startingAt: 0))  \(p.config.label.padding(toLength: 24, withPad: " ", startingAt: 0))  \(p.headline)\(stale)")
         }
     } catch { die("\(error)") }
 
@@ -536,6 +538,13 @@ case "export", "serve":
         }
     } catch { die("\(error)") }
     let config = profile?.config ?? .runtimeDefaults
+    if let p = profile, p.isStale(for: inst) {
+        FileHandle.standardError.write(Data("""
+            warning: this profile was tuned on llama.cpp build \(p.runtimeBuild.map(String.init) ?? "?"), but build \(inst.buildNumber.map(String.init) ?? "?") is installed.
+                     The best settings can change between builds. Re-tune: zoomies tune \(a) --goal \(p.objective?.rawValue ?? "generation")
+
+            """.utf8))
+    }
     let argv = ServerCommand.arguments(config: config, modelPath: url.path, installation: inst, adapter: adapter, contextTokens: ctx) + passthrough
     if command == "export" {
         if !asJSON { print("# \(profile.map { "\($0.name): \($0.headline)" } ?? "llama.cpp defaults (no profile active)")") }

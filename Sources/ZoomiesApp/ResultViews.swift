@@ -347,6 +347,10 @@ struct ProfilesScreen: View {
                         }
                         Text("\(p.headline) · \(p.createdAt.formatted(date: .abbreviated, time: .shortened))")
                             .font(Theme.tiny).foregroundStyle(Theme.tertiary).lineLimit(1)
+                        if p.isStale(for: app.installation) {
+                            Text("Tuned on llama.cpp build \(p.runtimeBuild.map(String.init) ?? "?"); re-tune for build \(app.installation?.buildNumber.map(String.init) ?? "?")")
+                                .font(Theme.tiny).foregroundStyle(Theme.warn)
+                        }
                     }
                     Spacer()
                     PillButton(title: "Copy command", icon: "doc.on.doc") {

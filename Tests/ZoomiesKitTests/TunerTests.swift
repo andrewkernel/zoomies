@@ -192,3 +192,41 @@ final class FlagSwapProbe: HardwareProbe, @unchecked Sendable {
         #expect(r.decision.config.ubatchSize != 2048)
     }
 }
+
+@Suite struct ServerPathTests {
+    /// Regression: exports pointed at …/Cellar/llama.cpp/1.0.0/bin/llama-server, which
+    /// disappears on `brew upgrade`. The stable …/bin link must be used instead.
+    @Test func prefersTheStableHomebrewLink() throws {
+        let fm = FileManager.default
+        let prefix = tempDir()
+        let cellarBin = prefix.appendingPathComponent("Cellar/llama.cpp/1.0.0/bin")
+        let bin = prefix.appendingPathComponent("bin")
+        try fm.createDirectory(at: cellarBin, withIntermediateDirectories: true)
+        try fm.createDirectory(at: bin, withIntermediateDirectories: true)
+        for tool in ["llama-bench", "llama-server"] {
+            let real = cellarBin.appendingPathComponent(tool)
+            try "#!/bin/sh\n".write(to: real, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: real.path)
+            try fm.createSymbolicLink(atPath: bin.appendingPathComponent(tool).path,
+                                      withDestinationPath: "../Cellar/llama.cpp/1.0.0/bin/\(tool)")
+        }
+        let bench = cellarBin.appendingPathComponent("llama-bench").path  // what discovery records (resolved)
+        #expect(ServerCommand.executable(near: bench, searchPath: "") == bin.appendingPathComponent("llama-server").path)
+        // Without a stable link that points at the same binary, fall back to the sibling.
+        try fm.removeItem(at: bin.appendingPathComponent("llama-server"))
+        #expect(ServerCommand.executable(near: bench, searchPath: "") == cellarBin.appendingPathComponent("llama-server").path)
+    }
+
+    @Test func profilesFromAnotherBuildAreStale() {
+        var p = TuningProfile(name: "x", modelPath: "/m.gguf", modelName: "m", modelFingerprint: "f", hardwareFingerprint: "h",
+                              runtimeBuild: 12359, objective: .response, config: InferenceConfig(ubatchSize: 256),
+                              headline: "", tuneRunID: nil, contextTokens: 0)
+        var inst = RuntimeInstallation(runtimeID: "llama.cpp", executable: "/x", version: nil, buildNumber: 12359, commit: nil,
+                                       flags: [], flagUsage: [:], devices: [])
+        #expect(!p.isStale(for: inst))
+        inst.buildNumber = 12400
+        #expect(p.isStale(for: inst))
+        p.runtimeBuild = nil
+        #expect(!p.isStale(for: inst))  // unknown build: don't cry wolf
+    }
+}
