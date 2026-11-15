@@ -75,7 +75,14 @@ func fixture(_ name: String) -> URL {
 /// A stand-in for llama-bench: a shell script that answers --version/--help
 /// and prints JSONL results. Throughput depends on -fa so comparisons have a
 /// known right answer; a little pid-derived noise keeps CIs non-degenerate.
-func fakeLlamaBench(in dir: URL, sleepSeconds: Int = 0, fail: Bool = false) -> URL {
+/// A fake llama-bench that behaves like the real one where Zoomies depends on it:
+/// comma-separated values run as a cross product in one process, and every JSON
+/// line reports the effective settings. Its performance model (deterministic,
+/// plus a little per-process noise): fa=on gives +15% pp and +10% tg; ub=1024 or
+/// more gives +6% pp when the prompt is at least that long; q8_0/q4_0 KV caches
+/// cost 1%/3% tg; threads and poll change nothing.
+func fakeLlamaBench(in dir: URL, sleepSeconds: Int = 0, fail: Bool = false, flashAttentionHelps: Bool = true,
+                    memoryHogFlag: URL? = nil) -> URL {
     let help = fixture("llama-bench-b11347-help.txt").path
     let script = """
     #!/bin/sh
@@ -86,18 +93,37 @@ func fakeLlamaBench(in dir: URL, sleepSeconds: Int = 0, fail: Bool = false) -> U
     esac
     \(sleepSeconds > 0 ? "sleep \(sleepSeconds)" : "")
     \(fail ? "echo 'llama_model_load: error loading model' >&2; exit 1" : "")
-    FA=auto; T=4; prev=""
+    FA=auto; T=2; UB=512; CTK=f16; CTV=f16; POLL=50; P=512; N=128; D=0; R=3; prev=""
     for a in "$@"; do
-      case "$prev" in -fa) FA=$a;; -t) T=$a;; esac
+      case "$prev" in -fa) FA=$a;; -t) T=$a;; -ub) UB=$a;; -ctk) CTK=$a;; -ctv) CTV=$a;; --poll) POLL=$a;; -p) P=$a;; -n) N=$a;; -d) D=$a;; -r) R=$a;; esac
       prev=$a
     done
-    N=$(( $$ % 7 ))
-    PP=$(( 1000 + N )); TG=$(( 50 ))
-    if [ "$FA" = "on" ]; then PP=$(( 1150 + N )); TG=55; fi
     echo "ggml_metal_device_init: testing tensor API for f16 support" >&2
     echo "some log line on stdout"
-    echo "{\\"build_commit\\":\\"abc1234\\",\\"build_number\\":7100,\\"n_prompt\\":512,\\"n_gen\\":0,\\"n_depth\\":0,\\"n_threads\\":$T,\\"flash_attn\\":\\"$FA\\",\\"avg_ts\\":$PP,\\"stddev_ts\\":2.0,\\"samples_ts\\":[$((PP-2)),$PP,$((PP+2))]}"
-    echo "{\\"build_commit\\":\\"abc1234\\",\\"build_number\\":7100,\\"n_prompt\\":0,\\"n_gen\\":128,\\"n_depth\\":0,\\"n_threads\\":$T,\\"flash_attn\\":\\"$FA\\",\\"avg_ts\\":$TG.$N,\\"stddev_ts\\":0.1,\\"samples_ts\\":[$TG.$N,$TG.$N,$TG.$N]}"
+    NOISE=$(( $$ % 7 ))
+    for fa in $(echo $FA | tr ',' ' '); do for t in $(echo $T | tr ',' ' '); do for ub in $(echo $UB | tr ',' ' '); do
+    for ctk in $(echo $CTK | tr ',' ' '); do for ctv in $(echo $CTV | tr ',' ' '); do for poll in $(echo $POLL | tr ',' ' '); do
+      case $fa in on) FAN=1;; off) FAN=0;; *) FAN=-1;; esac
+      \(memoryHogFlag.map { "if [ \"$ub\" -ge 2048 ]; then touch '\($0.path)'; sleep 5; fi" } ?? "")
+      if [ "$ctv" != "f16" ] && [ "$fa" = "off" ]; then echo "llama_init_from_model: V cache quantization requires flash_attn" >&2; exit 1; fi
+      awk -v fa=$fa -v ub=$ub -v p=$P -v n=$N -v d=$D -v r=$R -v ctv=$ctv -v noise=$NOISE -v fan=$FAN \\
+          -v t=$t -v ctk=$ctk -v poll=$poll 'BEGIN {
+        pp = 1000 + noise; tg = 50 + noise / 10.0
+        if (fa == "on" && \(flashAttentionHelps ? 1 : 0)) { pp *= 1.15; tg *= 1.10 }
+        if (ub + 0 >= 1024 && p + 0 >= 1024) pp *= 1.06
+        if (ctv == "q8_0") tg *= 0.99
+        if (ctv == "q4_0") tg *= 0.97
+        common = sprintf("\\"build_commit\\":\\"abc1234\\",\\"build_number\\":7100,\\"n_threads\\":%s,\\"n_ubatch\\":%s,\\"n_batch\\":2048,\\"flash_attn\\":%s,\\"type_k\\":\\"%s\\",\\"type_v\\":\\"%s\\",\\"poll\\":%s,\\"n_gpu_layers\\":-1,\\"n_depth\\":%s", t, ub, fan, ctk, ctv, poll, d)
+        if (p > 0) {
+          s = ""; for (i = 0; i < r; i++) s = s (i ? "," : "") sprintf("%.2f", pp + (i - 1) * 2)
+          printf("{%s,\\"n_prompt\\":%s,\\"n_gen\\":0,\\"avg_ts\\":%.2f,\\"samples_ts\\":[%s]}\\n", common, p, pp, s)
+        }
+        if (n > 0) {
+          s = ""; for (i = 0; i < r; i++) s = s (i ? "," : "") sprintf("%.3f", tg + (i - 1) * 0.05)
+          printf("{%s,\\"n_prompt\\":0,\\"n_gen\\":%s,\\"avg_ts\\":%.3f,\\"samples_ts\\":[%s]}\\n", common, n, tg, s)
+        }
+      }'
+    done; done; done; done; done; done
     """
     let url = dir.appendingPathComponent("llama-bench")
     try! script.write(to: url, atomically: true, encoding: .utf8)

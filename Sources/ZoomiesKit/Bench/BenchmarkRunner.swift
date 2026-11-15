@@ -1,6 +1,6 @@
 import Foundation
 
-public let zoomiesVersion = "0.1.0-dev"
+public let zoomiesVersion = "0.2.0"
 
 public struct SafetyLimits: Codable, Sendable, Equatable {
     /// Benchmarks on battery are slower, noisier and drain it; off unless asked.
@@ -11,8 +11,18 @@ public struct SafetyLimits: Codable, Sendable, Equatable {
     /// Runs are stopped at this thermal state.
     public var abortThermal: ThermalLevel = .serious
     public var abortMemoryPressure: MemoryPressureLevel = .critical
-    /// Stop if swap grows by more than this during a run (the model is not fitting).
+    /// Memory pressure must stay at `abortMemoryPressure` this long before a run
+    /// is stopped. macOS reports brief critical spikes while it evicts file cache
+    /// to map a large model; those are harmless. Sustained pressure is not, and
+    /// real swapping is caught by `maxSwapGrowthBytes`. nil means 5 s.
+    public var memoryPressureGraceSeconds: Double?
+    /// Stop a benchmark process if system swap grows by more than this while it
+    /// runs: that process is being disturbed by paging (it does not fit).
     public var maxSwapGrowthBytes: UInt64 = 1 << 30
+    /// Stop the whole plan or tune if swap grows by more than this from its start.
+    /// Separate from the per-process limit because memory macOS pages out once
+    /// stays in swap and should not count against every later process. nil = 3 GiB.
+    public var maxTotalSwapGrowthBytes: UInt64?
     public var perRunTimeoutSeconds: Double = 900
     /// Whole-plan budget; remaining runs are skipped once exceeded.
     public var maxTotalSeconds: Double?
@@ -200,8 +210,11 @@ public struct BenchmarkRunner: Sendable {
 
     // MARK: Run
 
+    /// `swapBaseline`: swap usage to measure growth from (a tune passes the value
+    /// from its own start, so growth across stages is caught). Defaults to now.
     public func run(plan: BenchmarkPlan, modelURL: URL, model: ModelInfo, installation: RuntimeInstallation,
-                    dryRun: Bool = false, onEvent: @escaping @Sendable (BenchmarkEvent) -> Void = { _ in }) async -> BenchmarkReport {
+                    dryRun: Bool = false, swapBaseline: UInt64? = nil,
+                    onEvent: @escaping @Sendable (BenchmarkEvent) -> Void = { _ in }) async -> BenchmarkReport {
         let started = Date()
         let hw = probe.hardware()
         let state0 = probe.state()
@@ -231,21 +244,7 @@ public struct BenchmarkRunner: Sendable {
 
         let schedule = plan.schedule()
         let limits = plan.limits
-        let probe = self.probe
-        let swap0 = state0.memory?.swapUsedBytes
-        let guardCheck: ChildGuard = {
-            let s = probe.state()
-            if s.thermal != .unavailable && s.thermal >= limits.abortThermal { return "thermal state reached \(s.thermal.rawValue)" }
-            if let m = s.memory {
-                if m.pressure != .unavailable && m.pressure >= limits.abortMemoryPressure { return "memory pressure \(m.pressure.rawValue)" }
-                if let a = swap0, let b = m.swapUsedBytes, b > a, b - a > limits.maxSwapGrowthBytes {
-                    return "system swap grew by \(fmtBytes(b - a)) since the run started; memory is tight, close other apps"
-                }
-            }
-            if s.power.source == .battery && !limits.allowBattery { return "switched to battery power" }
-            if s.power.source == .battery, let p = s.power.batteryPercent, p < limits.minBatteryPercent { return "battery below \(limits.minBatteryPercent)%" }
-            return nil
-        }
+        let guardCheck = Self.makeGuard(probe: probe, limits: limits, swapAtStart: swapBaseline ?? state0.memory?.swapUsedBytes)
 
         for (seq, item) in schedule.enumerated() {
             if Task.isCancelled { report.status = .cancelled; break }
@@ -258,38 +257,8 @@ public struct BenchmarkRunner: Sendable {
             onEvent(.trialStarted(index: seq, total: schedule.count, round: item.round, label: config.label))
             let cmd = adapter.benchmarkCommand(model: modelURL, config: config, workload: plan.workload,
                                                repetitions: plan.repetitions, installation: installation)
-            let before = probe.state()
-            var trial = Trial(sequence: seq, round: item.round, configIndex: item.config, command: cmd, outcome: .cancelled,
-                              measurements: [], wallSeconds: 0, peakFootprintBytes: nil, energyNanojoules: nil,
-                              stateBefore: before, stateAfter: before, notableLog: [], error: nil)
-            do {
-                let r = try await ChildProcess.run(cmd, timeout: limits.perRunTimeoutSeconds, guardCheck: guardCheck, registry: registry)
-                trial.outcome = r.outcome
-                trial.wallSeconds = r.wallSeconds
-                trial.peakFootprintBytes = r.peakFootprintBytes
-                trial.peakResidentBytes = r.peakResidentBytes
-                trial.energyNanojoules = r.energyNanojoules
-                trial.notableLog = LlamaBenchAdapter.notableLogLines(r.stderr)
-                // When Zoomies stopped the process, say so; its partial output is not a llama-bench failure.
-                switch r.outcome {
-                case .aborted(let reason): trial.error = "stopped by safety guard: \(reason)"
-                case .timedOut: trial.error = "timed out after \(Int(limits.perRunTimeoutSeconds)) s"
-                case .cancelled: trial.error = "cancelled"
-                case .exited, .signaled:
-                    do {
-                        trial.measurements = try adapter.parseBenchmarkOutput(stdout: r.stdout, stderr: r.stderr)
-                    } catch {
-                        trial.error = "\(error)"
-                    }
-                    if !r.outcome.isSuccess && trial.error == nil {
-                        trial.error = "process ended: \(r.outcome); stderr tail: \(LlamaBenchAdapter.errorTail(r.stderr))"
-                    }
-                }
-            } catch {
-                trial.error = "could not start: \(error)"
-                trial.outcome = .aborted(reason: "launch failed")
-            }
-            trial.stateAfter = probe.state()
+            let trial = await execute(cmd, sequence: seq, round: item.round, configIndex: item.config,
+                                      limits: limits, guardCheck: guardCheck)
             report.trials.append(trial)
             onEvent(.trialFinished(trial))
 
@@ -312,6 +281,82 @@ public struct BenchmarkRunner: Sendable {
         }
         report.finishedAt = Date()
         return report
+    }
+
+    /// The safety guard polled while a benchmark process runs. Swap growth is
+    /// measured from `swapAtStart`, the start of the whole plan or tune.
+    public static func makeGuard(probe: HardwareProbe, limits: SafetyLimits, swapAtStart: UInt64?) -> ChildGuard {
+        let pressureSince = PressureClock()
+        let grace = limits.memoryPressureGraceSeconds ?? 5
+        return {
+            let s = probe.state()
+            if s.thermal != .unavailable && s.thermal >= limits.abortThermal { return "thermal state reached \(s.thermal.rawValue)" }
+            if let m = s.memory {
+                if m.pressure != .unavailable && m.pressure >= limits.abortMemoryPressure {
+                    if pressureSince.elapsed(now: Date()) >= grace {
+                        return "memory pressure \(m.pressure.rawValue) for \(Int(grace)) s"
+                    }
+                } else {
+                    pressureSince.reset()
+                }
+                let total = limits.maxTotalSwapGrowthBytes ?? (3 << 30)
+                if let a = swapAtStart, let b = m.swapUsedBytes, b > a, b - a > total {
+                    return "system swap grew by \(fmtBytes(b - a)) since the run started; memory is tight, close other apps"
+                }
+            }
+            if s.power.source == .battery && !limits.allowBattery { return "switched to battery power" }
+            if s.power.source == .battery, let p = s.power.batteryPercent, p < limits.minBatteryPercent { return "battery below \(limits.minBatteryPercent)%" }
+            return nil
+        }
+    }
+
+    /// Runs one benchmark process under the guard and turns it into a Trial.
+    /// A process Zoomies stopped is reported as stopped, never as a runtime failure.
+    public func execute(_ cmd: [String], sequence: Int, round: Int, configIndex: Int,
+                        limits: SafetyLimits, guardCheck: ChildGuard?) async -> Trial {
+        let before = probe.state()
+        var trial = Trial(sequence: sequence, round: round, configIndex: configIndex, command: cmd, outcome: .cancelled,
+                          measurements: [], wallSeconds: 0, peakFootprintBytes: nil, energyNanojoules: nil,
+                          stateBefore: before, stateAfter: before, notableLog: [], error: nil)
+        // Per-process swap check, measured from this process's start.
+        let probe = self.probe
+        let swap0 = before.memory?.swapUsedBytes
+        let perProcess: ChildGuard = {
+            guard let a = swap0, let b = probe.state().memory?.swapUsedBytes, b > a, b - a > limits.maxSwapGrowthBytes else { return nil }
+            return "system swap grew by \(fmtBytes(b - a)) during this measurement; it does not fit in memory alongside your other apps"
+        }
+        let combined: ChildGuard = { guardCheck?() ?? perProcess() }
+        do {
+            let r = try await ChildProcess.run(cmd, timeout: limits.perRunTimeoutSeconds, guardCheck: combined, registry: registry)
+            trial.outcome = r.outcome
+            trial.wallSeconds = r.wallSeconds
+            trial.peakFootprintBytes = r.peakFootprintBytes
+            trial.peakResidentBytes = r.peakResidentBytes
+            trial.energyNanojoules = r.energyNanojoules
+            trial.notableLog = LlamaBenchAdapter.notableLogLines(r.stderr)
+            switch r.outcome {
+            case .aborted(let reason):
+                trial.error = "stopped by safety guard: \(reason)"
+                // Tests that finished before the stop are complete and valid; keep them.
+                trial.measurements = (try? adapter.parseBenchmarkOutput(stdout: r.stdout, stderr: r.stderr)) ?? []
+            case .timedOut: trial.error = "timed out after \(Int(limits.perRunTimeoutSeconds)) s"
+            case .cancelled: trial.error = "cancelled"
+            case .exited, .signaled:
+                do {
+                    trial.measurements = try adapter.parseBenchmarkOutput(stdout: r.stdout, stderr: r.stderr)
+                } catch {
+                    trial.error = "\(error)"
+                }
+                if !r.outcome.isSuccess && trial.error == nil {
+                    trial.error = "process ended: \(r.outcome); stderr tail: \(LlamaBenchAdapter.errorTail(r.stderr))"
+                }
+            }
+        } catch {
+            trial.error = "could not start: \(error)"
+            trial.outcome = .aborted(reason: "launch failed")
+        }
+        trial.stateAfter = probe.state()
+        return trial
     }
 
     // MARK: Analysis
@@ -376,6 +421,18 @@ public struct BenchmarkRunner: Sendable {
         }
         return out
     }
+}
+
+/// When memory pressure first reached the abort level; reset when it drops.
+final class PressureClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var since: Date?
+    func elapsed(now: Date) -> Double {
+        lock.lock(); defer { lock.unlock() }
+        if since == nil { since = now }
+        return now.timeIntervalSince(since!)
+    }
+    func reset() { lock.lock(); since = nil; lock.unlock() }
 }
 
 /// Small deterministic RNG so a plan's run order can be reproduced from its seed.

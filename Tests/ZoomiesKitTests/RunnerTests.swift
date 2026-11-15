@@ -172,3 +172,45 @@ final class SwapGrowingProbe: HardwareProbe, @unchecked Sendable {
         #expect(LlamaBenchAdapter.errorTail(err) == "llama_model_load: error loading model: bad magic")
     }
 }
+
+/// Critical memory pressure for the first `seconds` after creation, then normal.
+final class PressureSpikeProbe: HardwareProbe, @unchecked Sendable {
+    let base = FakeProbe()
+    let start = Date()
+    let seconds: TimeInterval
+    init(criticalFor seconds: TimeInterval) { self.seconds = seconds }
+    func hardware() -> HardwareInfo { base.hw }
+    func state() -> SystemState {
+        var s = base.st
+        if Date().timeIntervalSince(start) < seconds { s.memory?.pressure = .critical }
+        return s
+    }
+}
+
+@Suite(.serialized) struct PressureGraceTests {
+    /// Regression: loading a 14B model made macOS report critical pressure for a
+    /// moment, and the guard stopped the run although pressure recovered (2026-11-14).
+    @Test func briefSpikeIsTolerated() async throws {
+        var limits = SafetyLimits()
+        limits.memoryPressureGraceSeconds = 2
+        let g = BenchmarkRunner.makeGuard(probe: PressureSpikeProbe(criticalFor: 0.6), limits: limits, swapAtStart: 0)
+        var stops: [String] = []
+        for _ in 0..<12 {
+            if let r = g() { stops.append(r) }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        #expect(stops.isEmpty)
+    }
+
+    @Test func sustainedPressureStops() async throws {
+        var limits = SafetyLimits()
+        limits.memoryPressureGraceSeconds = 0.5
+        let g = BenchmarkRunner.makeGuard(probe: PressureSpikeProbe(criticalFor: 60), limits: limits, swapAtStart: 0)
+        var stop: String?
+        for _ in 0..<12 where stop == nil {
+            stop = g()
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        #expect(stop?.hasPrefix("memory pressure critical") == true)
+    }
+}

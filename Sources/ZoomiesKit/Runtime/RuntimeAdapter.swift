@@ -209,4 +209,26 @@ public protocol RuntimeAdapter: Sendable {
 
     /// Turns the process output into measurements; throws when it holds none.
     func parseBenchmarkOutput(stdout: String, stderr: String) throws -> [TestMeasurement]
+
+    // MARK: Tuning support (optional; defaults mean "not supported")
+
+    /// The installed build's default for a setting, in the runtime's spelling
+    /// ("auto", "512"), read from the build itself where possible.
+    func defaultValue(_ d: TuneDimension, installation: RuntimeInstallation) -> String?
+
+    /// One process that measures several values of one setting, loading the
+    /// model once. nil if the runtime cannot do this; the tuner then falls back
+    /// to one process per value.
+    func sweepCommand(model: URL, dimension: TuneDimension, values: [String], workload: Workload,
+                      repetitions: Int, installation: RuntimeInstallation) -> [String]?
+
+    /// Which value of `d` a measurement from a sweep was taken with.
+    func effectiveValue(_ d: TuneDimension, of m: TestMeasurement) -> String?
+}
+
+extension RuntimeAdapter {
+    public func defaultValue(_ d: TuneDimension, installation: RuntimeInstallation) -> String? { nil }
+    public func sweepCommand(model: URL, dimension: TuneDimension, values: [String], workload: Workload,
+                             repetitions: Int, installation: RuntimeInstallation) -> [String]? { nil }
+    public func effectiveValue(_ d: TuneDimension, of m: TestMeasurement) -> String? { nil }
 }

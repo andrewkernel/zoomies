@@ -9,11 +9,22 @@ import ZoomiesKit
 //   zoomies bench <model.gguf> [--config "ngl=99,fa=on"]... [options]
 //   zoomies history [--limit N]
 //   zoomies show <run-id> [--json]
+//   zoomies tune <model> [--goal G] [--budget B] ...
+//   zoomies profiles / apply / rollback / export / serve / models / cost
 
 let usage = """
 zoomies \(zoomiesVersion) — measured speedups for local LLMs
 
 USAGE
+  zoomies tune MODEL [options]           Find faster settings and prove them against the defaults
+  zoomies models                         Models found on this Mac (incl. Ollama, LM Studio)
+  zoomies profiles [MODEL]               Saved profiles; * marks the active one
+  zoomies apply PROFILE_ID | --defaults MODEL
+                                         Make a profile (or llama.cpp's defaults) active
+  zoomies rollback MODEL                 Return to the previously active profile
+  zoomies export MODEL [-c N]            Print the llama-server command for the active profile
+  zoomies serve MODEL [-c N] [-- ARGS]   Start llama-server with the active profile
+  zoomies cost MODEL                     Seconds per 1k prompt tokens as the context grows
   zoomies probe [--json]                 Hardware and current system state
   zoomies inspect MODEL [--json] [--full-hash]
                                          Read a GGUF model's header (no weights loaded)
@@ -21,6 +32,19 @@ USAGE
   zoomies bench MODEL [options]          Benchmark configs against llama.cpp's defaults
   zoomies history [--limit N]            Recent runs from the results database
   zoomies show RUN_ID [--json]           One stored run
+
+MODEL can be a path or a name from `zoomies models` (e.g. qwen3-14b, llama3.2:3b).
+
+TUNE OPTIONS
+  --goal G          generation (default) | response | balanced | memory
+  --budget B        quick | standard (default) | thorough
+  --context N       Tokens already in the conversation while measuring (default 0)
+  --prompt N        Prompt size for response/balanced goals (default 2048/1024)
+  --allow-kv-quant  Also try quantized KV caches (saves memory; output changes slightly)
+  --max-minutes M   Stop after M minutes
+  --apply           Make the result the active profile
+  --dry-run         Show the search space and commands; run nothing
+  --allow-battery, --llama-bench P, --db PATH, --seed N, --json
 
 BENCH OPTIONS
   --config SPEC     Add a config to compare, e.g. "ngl=99,fa=off,ub=1024" (repeatable).
@@ -80,6 +104,50 @@ func printJSON<T: Encodable>(_ v: T) {
 
 func f1(_ x: Double) -> String { String(format: "%.1f", x) }
 func f2(_ x: Double) -> String { String(format: "%.2f", x) }
+
+
+func store(_ path: String?) -> ResultStore {
+    do { return try ResultStore(url: path.map { URL(fileURLWithPath: $0) } ?? AppPaths.database) } catch { die("\(error)") }
+}
+
+/// A path, or a unique name match from the model library.
+func resolveModel(_ arg: String) -> URL {
+    let fm = FileManager.default
+    let expanded = (arg as NSString).expandingTildeInPath
+    if fm.fileExists(atPath: expanded) { return URL(fileURLWithPath: expanded) }
+    let lib = ModelLibrary.scan()
+    if let exact = lib.first(where: { $0.displayName.caseInsensitiveCompare(arg) == .orderedSame }) { return exact.url }
+    let hits = lib.filter { $0.displayName.localizedCaseInsensitiveContains(arg) }
+    if hits.count == 1 { return hits[0].url }
+    if hits.isEmpty { die("no model file or library model matches '\(arg)'. See `zoomies models`.") }
+    die("'\(arg)' matches several models:\n" + hits.map { "  \($0.displayName)  (\($0.url.path))" }.joined(separator: "\n"))
+}
+
+func inspectOrDie(_ url: URL) -> ModelInfo {
+    do { return try ModelInspector.inspect(url) } catch { die("\(error)") }
+}
+
+func discoverOrDie(_ path: String?) -> (LlamaBenchAdapter, RuntimeInstallation) {
+    let a = LlamaBenchAdapter(explicitPath: path)
+    do { return (a, try a.discover()) } catch { die("\(error)") }
+}
+
+/// Runs an async job; Ctrl+C cancels it so children stop and partial results are kept.
+func runCancellable<T: Sendable>(_ message: String = "Stopping (keeping finished results)...", _ job: @escaping @Sendable () async -> T) async -> T {
+    let task = Task { await job() }
+    signal(SIGINT, SIG_IGN)
+    let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    sigint.setEventHandler { print("\n" + message); task.cancel() }
+    sigint.resume()
+    let v = await task.value
+    sigint.cancel()
+    signal(SIGINT, SIG_DFL)
+    return v
+}
+
+func fmtDuration(_ s: Double) -> String {
+    s >= 90 ? String(format: "%.0f min", s / 60) : String(format: "%.0f s", s)
+}
 
 setvbuf(stdout, nil, _IOLBF, 0)  // line-buffered so progress and results interleave correctly
 
@@ -284,6 +352,228 @@ case "show":
         guard let r = try store.report(id: id) else { die("no run \(id)") }
         printJSON(r)
     } catch { die("\(error)") }
+
+case "tune":
+    let llamaBench = option("--llama-bench")
+    let goal = option("--goal") ?? "generation"
+    let budgetName = option("--budget") ?? "standard"
+    let context = Int(option("--context") ?? "0") ?? 0
+    let promptTokens = option("--prompt").flatMap(Int.init)
+    let maxMinutes = option("--max-minutes").flatMap(Double.init)
+    let seed = option("--seed").flatMap(UInt64.init) ?? UInt64.random(in: 1...UInt64.max)
+    let dbPath = option("--db")
+    let allowKV = flag("--allow-kv-quant")
+    let applyResult = flag("--apply")
+    let tuneDryRun = flag("--dry-run")
+    var limits = SafetyLimits()
+    limits.allowBattery = flag("--allow-battery")
+    guard let objective = TuneObjective(rawValue: goal) else { die("--goal must be generation, response, balanced or memory") }
+    guard let budget = TuneBudget(rawValue: budgetName) else { die("--budget must be quick, standard or thorough") }
+    guard let arg = args.first else { die("tune needs a model") }
+    let modelURL = resolveModel(arg)
+    let model = inspectOrDie(modelURL)
+    let (adapter, inst) = discoverOrDie(llamaBench)
+    let request = TuneRequest(objective: objective, budget: budget,
+                              constraints: TuneConstraints(contextTokens: context, promptTokens: promptTokens,
+                                                           allowKVQuantization: allowKV, maxSeconds: maxMinutes.map { $0 * 60 },
+                                                           limits: limits),
+                              seed: seed)
+    if tuneDryRun {
+        let space = SearchSpace.build(request: request, model: model, hardware: probe.hardware(), installation: inst, adapter: adapter)
+        print("Search space for \(objective.title.lowercased()) (\(budget.rawValue)); default value first:")
+        for d in space {
+            print("  \(d.dimension.title.padding(toLength: 16, withPad: " ", startingAt: 0)) \(d.values.joined(separator: " | "))")
+            for n in d.notes { print("      \(n)") }
+            if d.values.count >= 2, let cmd = adapter.sweepCommand(model: modelURL, dimension: d.dimension, values: d.values,
+                                                                    workload: request.workload, repetitions: budget.repetitions, installation: inst) {
+                print("      " + ServerCommand.shellLine(cmd))
+            }
+        }
+        let pre = BenchmarkRunner.preflight(plan: BenchmarkPlan(workload: request.workload, configs: [.runtimeDefaults], rounds: 2, limits: limits),
+                                            model: model, hardware: probe.hardware(), state: probe.state())
+        for i in pre { print("  \(i)") }
+        print("Then: up to \(budget.maxCandidates) candidates narrowed over \(budget.narrowingRounds.map(String.init).joined(separator: "+")) rounds, "
+              + "and the winner verified against the defaults on \(budget.validationRounds) fresh rounds.")
+        exit(pre.contains(where: \.blocking) ? 2 : 0)
+    }
+    ChildRegistry.shared.reapOrphans()
+    let db = store(dbPath)
+    let tuner = Tuner(runner: BenchmarkRunner(adapter: adapter, probe: probe))
+    let w = request.workload
+    print("Tuning \((model.fileName as NSString).deletingPathExtension) [\(model.quantization ?? "?")] for \(objective.title.lowercased()), \(budget.rawValue) budget")
+    print("Workload pp\(w.promptTokens) + tg\(w.genTokens)\(w.depth > 0 ? " at \(w.depth) tokens of context" : ""); llama.cpp build \(inst.buildNumber.map(String.init) ?? "?"); seed \(seed)\n")
+
+    let report = await runCancellable { () -> TuneReport in
+        await tuner.tune(request: request, modelURL: modelURL, model: model, installation: inst, onEvent: { ev in
+            switch ev {
+            case .stageStarted(let k, let detail): print("\n== \(k.title): \(detail)")
+            case .screening(let d, let values): print("  \(d.title.padding(toLength: 16, withPad: " ", startingAt: 0)) \(values.joined(separator: " | ")) ... ", terminator: ""); fflush(stdout)
+            case .screened(let r):
+                let parts = r.values.map { v -> String in
+                    let mark = v.isDefault ? " (default)" : (v.kept ? " ✓" : "")
+                    return v.isDefault ? "\(v.value)\(mark)" : "\(v.value) \(v.relativeScore.map { String(format: "%+.1f%%", $0 * 100) } ?? "n/a")\(mark)"
+                }
+                print(parts.joined(separator: ", ") + (r.note.map { "  [\($0)]" } ?? ""))
+            case .candidates(let cs): if !cs.isEmpty { print("\nCandidates: " + cs.map(\.label).joined(separator: " · ")) }
+            case .bench(.trialStarted(let i, let total, let round, let label)) where total > 0:
+                print("  [\(i + 1)/\(total)] round \(round + 1)  \(label) ... ", terminator: ""); fflush(stdout)
+            case .bench(.trialFinished(let t)) where t.configIndex < 0 && t.error != nil:
+                if case .aborted(let r) = t.outcome { print("STOPPED (\(r))") } else { print("FAILED (\(t.error!.prefix(120)))") }
+            case .bench(.trialFinished(let t)) where t.configIndex >= 0:
+                if let e = t.error { print("FAILED (\(e.prefix(160)))"); break }
+                print(t.measurements.map { "\($0.kind.rawValue) \(f1(Stats.mean($0.samplesTPS)))" }.joined(separator: ", "))
+            case .stageFinished(let st) where st.kind == .narrow:
+                for c in st.candidates {
+                    print("    \(c.kept ? "keep" : "drop")  \(c.label)  \(c.relativeScore.map { String(format: "%+.1f%%", $0 * 100) } ?? "n/a") vs defaults")
+                }
+            case .estimate(let s): print("  (about \(fmtDuration(s)) left)")
+            case .note(let n): print("  \(n)")
+            default: break
+            }
+        }, onBenchmarkReport: { rep in
+            if !rep.trials.isEmpty { try? ResultStore(url: dbPath.map { URL(fileURLWithPath: $0) } ?? AppPaths.database).save(rep) }
+        })
+    }
+    do { try db.save(report) } catch { FileHandle.standardError.write(Data("warning: tune not saved: \(error)\n".utf8)) }
+    var profile: TuningProfile?
+    if report.decision.kind != .incomplete {
+        let p = TuningProfile.from(report, modelURL: modelURL)
+        try? db.save(p)
+        profile = p
+        if applyResult { try? db.activate(report.decision.kind == .improved ? p.id : nil, modelFingerprint: p.modelFingerprint, hardwareFingerprint: p.hardwareFingerprint) }
+    }
+    if asJSON { printJSON(report); break }
+
+    let d = report.decision
+    print("\n" + String(repeating: "─", count: 60))
+    print(d.headline)
+    for line in d.details { print("  · \(line)") }
+    for wline in report.warnings { print("  note: \(wline)") }
+    print("  \(report.processCount) measurement processes in \(fmtDuration(report.finishedAt.timeIntervalSince(report.startedAt))); tune id \(report.id.uuidString)")
+    if d.kind == .improved {
+        let cmd = ServerCommand.arguments(config: d.config, modelPath: modelURL.path, installation: inst, adapter: adapter,
+                                          contextTokens: context > 0 ? context + 4096 : nil)
+        print("\nRun it:\n  \(ServerCommand.shellLine(cmd))")
+        if let p = profile {
+            print(applyResult ? "\nApplied as the active profile (\(p.id.uuidString.prefix(8))). Undo: zoomies rollback \(arg)"
+                              : "\nSaved as profile \(p.id.uuidString.prefix(8)). Make it active: zoomies apply \(p.id.uuidString.prefix(8))")
+        }
+    }
+    exit(d.kind == .incomplete ? 3 : 0)
+
+case "models":
+    let lib = ModelLibrary.scan()
+    if asJSON { printJSON(lib); break }
+    if lib.isEmpty { print("No GGUF models found in ~/Models, LM Studio, Ollama, llama.cpp or Hugging Face caches."); break }
+    for m in lib {
+        print("\(m.displayName.padding(toLength: 40, withPad: " ", startingAt: 0)) \(fmtBytes(m.sizeBytes).padding(toLength: 10, withPad: " ", startingAt: 0)) \(m.source.padding(toLength: 18, withPad: " ", startingAt: 0)) \(m.url.path)")
+    }
+
+case "profiles":
+    let db = store(option("--db"))
+    let hw = probe.hardware()
+    var modelFP: String?
+    if let a = args.first { modelFP = inspectOrDie(resolveModel(a)).quickFingerprint }
+    do {
+        let list = try db.profiles(modelFingerprint: modelFP, hardwareFingerprint: hw.fingerprint)
+        if asJSON { printJSON(list); break }
+        if list.isEmpty { print("No profiles yet. Run `zoomies tune MODEL`."); break }
+        var active: [String: UUID?] = [:]
+        for p in list where active[p.modelFingerprint] == nil {
+            active[p.modelFingerprint] = try db.activeProfile(modelFingerprint: p.modelFingerprint, hardwareFingerprint: hw.fingerprint)?.id
+        }
+        for p in list {
+            let mark = (active[p.modelFingerprint] ?? nil) == p.id ? "*" : " "
+            print("\(mark) \(p.id.uuidString.prefix(8))  \(p.modelName.padding(toLength: 28, withPad: " ", startingAt: 0))  \(p.config.label.padding(toLength: 24, withPad: " ", startingAt: 0))  \(p.headline)")
+        }
+    } catch { die("\(error)") }
+
+case "apply":
+    let db = store(option("--db"))
+    let hw = probe.hardware()
+    do {
+        if flag("--defaults") {
+            guard let a = args.first else { die("apply --defaults needs a model") }
+            let m = inspectOrDie(resolveModel(a))
+            try db.activate(nil, modelFingerprint: m.quickFingerprint, hardwareFingerprint: hw.fingerprint)
+            print("llama.cpp's defaults are now active for \(m.name ?? m.fileName).")
+            break
+        }
+        guard let idPrefix = args.first?.uppercased() else { die("apply needs a profile id (see `zoomies profiles`)") }
+        let matches = try db.profiles(hardwareFingerprint: hw.fingerprint).filter { $0.id.uuidString.hasPrefix(idPrefix) }
+        guard matches.count == 1, let p = matches.first else { die(matches.isEmpty ? "no profile \(idPrefix) for this Mac" : "ambiguous id \(idPrefix)") }
+        try db.activate(p.config == .runtimeDefaults ? nil : p.id, modelFingerprint: p.modelFingerprint, hardwareFingerprint: p.hardwareFingerprint)
+        print("Active for \(p.modelName): \(p.config.label)  (\(p.headline))")
+    } catch { die("\(error)") }
+
+case "rollback":
+    let db = store(option("--db"))
+    guard let a = args.first else { die("rollback needs a model") }
+    let m = inspectOrDie(resolveModel(a))
+    do {
+        let now = try db.rollback(modelFingerprint: m.quickFingerprint, hardwareFingerprint: probe.hardware().fingerprint)
+        print("Active for \(m.name ?? m.fileName): \(now.map { "\($0.config.label)  (\($0.headline))" } ?? "llama.cpp defaults")")
+    } catch { die("\(error)") }
+
+case "export", "serve":
+    let db = store(option("--db"))
+    let ctx = option("-c", "--ctx-size").flatMap(Int.init)
+    let profileID = option("--profile")?.uppercased()
+    var passthrough: [String] = []
+    if let dd = args.firstIndex(of: "--") { passthrough = Array(args[(dd + 1)...]); args.removeSubrange(dd...) }
+    guard let a = args.first else { die("\(command) needs a model") }
+    let url = resolveModel(a)
+    let m = inspectOrDie(url)
+    let (adapter, inst) = discoverOrDie(option("--llama-bench"))
+    let hw = probe.hardware()
+    var profile: TuningProfile?
+    do {
+        if let pid = profileID {
+            profile = try db.profiles(modelFingerprint: m.quickFingerprint, hardwareFingerprint: hw.fingerprint).first { $0.id.uuidString.hasPrefix(pid) }
+            if profile == nil { die("no profile \(pid) for this model on this Mac") }
+        } else {
+            profile = try db.activeProfile(modelFingerprint: m.quickFingerprint, hardwareFingerprint: hw.fingerprint)
+        }
+    } catch { die("\(error)") }
+    let config = profile?.config ?? .runtimeDefaults
+    let argv = ServerCommand.arguments(config: config, modelPath: url.path, installation: inst, adapter: adapter, contextTokens: ctx) + passthrough
+    if command == "export" {
+        if !asJSON { print("# \(profile.map { "\($0.name): \($0.headline)" } ?? "llama.cpp defaults (no profile active)")") }
+        print(ServerCommand.shellLine(argv))
+        break
+    }
+    print("Starting llama-server with \(profile.map { "profile \($0.name)" } ?? "llama.cpp defaults")")
+    print(ServerCommand.shellLine(argv))
+    // Replace this process, so Ctrl+C and exit codes behave exactly like llama-server.
+    // LLAMA_ARG_* variables are removed: they would silently override the profile.
+    let env = ChildProcess.sanitizedEnvironment().map { "\($0.key)=\($0.value)" }
+    var cArgs = argv.map { strdup($0) } + [nil]
+    var cEnv = env.map { strdup($0) } + [nil]
+    execve(argv[0].hasPrefix("/") ? argv[0] : "/opt/homebrew/bin/llama-server", &cArgs, &cEnv)
+    die("could not start llama-server: \(String(cString: strerror(errno)))")
+
+case "cost":
+    guard let a = args.first else { die("cost needs a model") }
+    let url = resolveModel(a)
+    let m = inspectOrDie(url)
+    let (adapter, inst) = discoverOrDie(option("--llama-bench"))
+    var limits = SafetyLimits()
+    limits.allowBattery = flag("--allow-battery")
+    let depths = ContextCost.depths(for: m, memoryBytes: probe.hardware().memoryBytes)
+    print("Measuring \(m.name ?? m.fileName) at \(depths.map(String.init).joined(separator: ", ")) tokens of context (one process)...")
+    let runner = BenchmarkRunner(adapter: adapter, probe: probe)
+    let costLimits = limits
+    let rep = await runCancellable { await ContextCost.measure(runner: runner, modelURL: url, model: m, installation: inst, depths: depths, limits: costLimits) }
+    if let e = rep.trial.error { die(e) }
+    if asJSON { printJSON(rep); break }
+    print("\n  context     1k prompt tokens    reply speed")
+    for p in rep.points {
+        let ctxs = (p.depth == 0 ? "empty" : "\(p.depth / 1024)k").padding(toLength: 10, withPad: " ", startingAt: 0)
+        let pp = p.secondsPer1kPromptTokens.map { String(format: "%6.2f s", $0) } ?? "   n/a"
+        let tg = p.generationTPS.map { String(format: "%6.1f tokens/s", $0) } ?? "n/a"
+        print("  \(ctxs)  \(pp)            \(tg)")
+    }
+    print("\nA 2,000-token file costs about \(rep.points.first?.secondsPer1kPromptTokens.map { String(format: "%.1f", $0 * 2) } ?? "?") s to read on an empty context. One run, not a confidence interval.")
 
 case "-h", "--help", "help":
     print(usage)

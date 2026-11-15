@@ -2,79 +2,109 @@
 
 **Give your local LLM the zoomies, with receipts.**
 
-Zoomies finds the fastest settings for running a local language model on *your* machine, and backs every recommendation with measurements and confidence intervals. It starts with llama.cpp on Apple Silicon Macs. MLX, Ollama, Windows, Linux, NVIDIA, AMD and CPU-only systems come later.
+Zoomies finds faster settings for running a local language model on *your* Mac, and only recommends a change after it has beaten llama.cpp's defaults on fresh, repeated measurements. If your defaults are already the best, it tells you so.
 
-> **Status: early prototype (0.1.0-dev).** Phase 1 (audit and research) is done. The benchmark foundation is a CLI. There is no optimizer and no Mac app yet. The first real measurements (one M5 MacBook Pro, one small model) are in [BENCHMARKS.md](BENCHMARKS.md#results). They are a measurement baseline, not tuning results. See [ROADMAP.md](ROADMAP.md).
+It comes as a Mac app and a command-line tool. It works with any GGUF model, including the ones you already have in Ollama, LM Studio or the llama.cpp cache.
 
-## Principles
+> **Status: 0.2.0, early.** Apple Silicon Macs with llama.cpp. MLX, Ollama as a runtime, and Linux/Windows come later. See [ROADMAP.md](ROADMAP.md) and the measured results in [BENCHMARKS.md](BENCHMARKS.md).
 
-- **Measured, not assumed.** A setting is recommended only when it beats the baseline by more than the measurement uncertainty. If your defaults are already best, Zoomies says so.
-- **Honest about uncertainty.** Results are means with 95% confidence intervals across separate runs, never a single fast run.
-- **Safe.** Zoomies won't start on battery (unless you allow it), when the Mac is hot, or under memory pressure. It stops a run when any of those changes, and it never needs root. Your models and configs are never modified.
-- **Reproducible.** Every run stores the exact command, the runtime build, a hardware fingerprint, the model fingerprint, the random run order and every sample, in a local SQLite database.
+## Install
 
-## Requirements
+You need macOS 14 or newer, Apple's free Command Line Tools (`xcode-select --install`), and llama.cpp (`brew install llama.cpp`).
 
-- macOS 14+ on Apple Silicon (Intel Macs work, but nothing is tuned for them)
-- Swift 6 toolchain: the Xcode Command Line Tools are enough
-- llama.cpp's `llama-bench`. Either `brew install llama.cpp`, or the `llama-*-bin-macos-arm64.tar.gz` from [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases).
-- A GGUF model file
-
-## Build
+**Homebrew** (the command-line tool; also installs llama.cpp):
 
 ```bash
-swift build -c release
+brew install andrewkernel/zoomies/zoomies
 ```
 
-The binary is at `.build/release/zoomies`.
+**Install script** (the command-line tool and the Mac app, built on your Mac):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/andrewkernel/zoomies/main/install.sh | sh
+```
+
+**From source:**
+
+```bash
+git clone https://github.com/andrewkernel/zoomies && cd zoomies
+swift build -c release            # .build/release/zoomies
+./scripts/build-app.sh            # .build/Zoomies.app
+```
+
+Zoomies isn't signed with an Apple Developer ID yet. Building it yourself (all three routes above) avoids macOS's "unidentified developer" warning entirely. If you download a prebuilt `Zoomies.app` from Releases instead, open it once, then go to System Settings → Privacy & Security and click **Open Anyway**.
 
 ## Use
 
+### The app
+
+Open Zoomies, pick a model and a goal, press **↑**. The centre card holds every setting:
+
+| Chip | What it sets |
+|---|---|
+| ● AC / battery | Whether this Mac is ready to measure (plugged in, cool, enough memory), plus runtime details |
+| Model | Any GGUF on this Mac, or choose a file |
+| Context | How much conversation is already in context while measuring (empty, 2k, 8k, 32k) |
+| Goal | Fastest replies · fastest first token · balanced · least memory, and whether quantized KV caches may be tried |
+| Budget | Quick · Standard · Thorough |
+
+While it runs, you see each stage live, and the background swirl spins with the measured speed. The result is a receipt: the change, its 95% confidence interval, what happened to the other metric, and buttons to **Apply**, **Undo**, or **Copy the llama-server command**.
+
+### The command line
+
 ```bash
-zoomies probe                      # your hardware and its current state
-zoomies inspect model.gguf         # model metadata, quantization, KV-cache estimates
-zoomies runtime                    # which llama-bench was found and what it supports
-zoomies bench model.gguf --config "fa=off" --config "ub=1024" --dry-run   # show checks and exact commands
-zoomies bench model.gguf --config "fa=off" --config "ub=1024"             # measure them against the defaults
-zoomies history                    # previous runs
+zoomies models                          # GGUF models on this Mac (incl. Ollama, LM Studio)
+zoomies tune qwen3-14b                  # find faster settings and verify them
+zoomies tune qwen3-14b --goal response --context 8192 --budget thorough
+zoomies tune qwen3-14b --dry-run        # what would be tried, and the exact commands
+zoomies profiles                        # saved results; * = active
+zoomies apply 3f2a91c0                  # make a profile active
+zoomies rollback qwen3-14b              # back to the previous one
+zoomies export qwen3-14b -c 8192        # the llama-server command for the active profile
+zoomies serve qwen3-14b -c 8192         # start llama-server with it
+zoomies cost qwen3-14b                  # seconds per 1k prompt tokens as the context grows
+zoomies bench model.gguf --config "fa=off" --config "ub=1024"   # compare settings yourself
 ```
 
-`bench` always runs llama.cpp's own defaults as the baseline. Then it runs each `--config` as separate processes over several rounds, in a shuffled order each round. Its report looks like this:
+Models can be given by path or by name from `zoomies models`.
 
-```
-  fa=off
-    pp: 2957.3  [2713.8–3200.7]  cv 1.2%   vs baseline -8.7% [-18.3%, +0.8%] → no detectable difference
-    tg: 94.8  [80.1–109.4]  cv 2.7%   vs baseline -2.5% [-74.1%, +69.1%] → no detectable difference
-```
+## How tuning works
 
-*(Real output: M5 MacBook Pro, Qwen2.5-1.5B Q4_K_M, llama.cpp b12359. Only 2 rounds, so the intervals are wide and Zoomies won't call it either way. That is the point.)*
+1. **Screen.** For each setting (flash attention, micro-batch, threads, polling, optionally the KV cache type), one llama-bench process tries every value with the model loaded once. Each value is compared with the default *in the same process*.
+2. **Narrow.** The best values, alone and combined, race the defaults as separate processes in a shuffled order; the bottom half is dropped each round.
+3. **Verify.** The survivor and the defaults run again on fresh rounds. A change is recommended only if the 95% confidence interval of the paired difference is above zero, the gain is at least 2%, and the other metric didn't get more than 5% worse.
+
+Fresh data in step 3 matters: picking the best of several noisy measurements flatters the winner, so the measurements that picked it can't also judge it.
+
+Settings that can't matter are never tried (a micro-batch larger than the prompt, partial GPU offload for a model that fits, thread pinning, which macOS doesn't support). Settings that change the model's output (quantized KV cache) are tried only if you allow it.
+
+**Safety.** Zoomies won't start on battery (unless you allow it), when the Mac is hot, or under memory pressure, and stops if any of that changes mid-run, including more than 1 GiB of new swap. It never needs root, never modifies your models, and never edits your own configs: profiles live in Zoomies and are exported as commands.
+
+**Receipts.** Every measurement, command line, runtime build, hardware and model fingerprint, and random seed is stored in `~/Library/Application Support/Zoomies/results.sqlite`.
+
+## What it measures
 
 | Metric | Source |
 |---|---|
-| `pp` | prompt-processing throughput, reported by llama-bench |
-| `tg` | token-generation throughput, reported by llama-bench |
-| peak resident memory | the llama-bench process's peak RSS. It counts memory-mapped model weights, but can miss some GPU-side buffers. |
-| peak footprint | the kernel's lifetime-max physical footprint, the "Memory" column in Activity Monitor. It **excludes memory-mapped weights**, so with llama.cpp's default loading it is far below what the model really occupies (measured: 147 MiB for a 1.04 GiB model). |
-| TTFT estimate | *derived*: prompt / pp + 1 / tg. Excludes load, tokenization and sampling. |
+| prompt speed (pp) | prompt-processing tokens/s, reported by llama-bench |
+| generation speed (tg) | generation tokens/s, reported by llama-bench |
+| peak resident memory | the llama-bench process's peak RSS; counts memory-mapped weights, can miss some GPU buffers |
+| peak footprint | Activity Monitor's "Memory"; **excludes memory-mapped weights** (measured: 147 MiB for a 1.04 GiB model) |
+| time-to-first-token estimate | *derived*: prompt / pp + 1 / tg; excludes load, tokenization and sampling |
 
-The results database lives at `~/Library/Application Support/Zoomies/results.sqlite`.
-
-## Test
+## Development
 
 ```bash
-./scripts/test.sh
+./scripts/test.sh                 # 45+ tests; a fake llama-bench, no model or GPU needed
+./scripts/build-app.sh --dmg      # app bundle and disk image
 ```
-
-The tests use a fake `llama-bench` and synthetic GGUF files, so they need no model and no GPU time.
-
-## Documentation
 
 | File | Contents |
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | How the pieces fit |
 | [RESEARCH.md](RESEARCH.md) | Evidence behind the defaults, tagged by confidence |
-| [BENCHMARKS.md](BENCHMARKS.md) | Methodology and (soon) results, with reproduction commands |
-| [ROADMAP.md](ROADMAP.md) | Phases and prioritized backlog |
+| [BENCHMARKS.md](BENCHMARKS.md) | Methodology and measured results, with reproduction commands |
+| [ROADMAP.md](ROADMAP.md) | Phases and backlog |
 | [docs/AUDIT-llama-autotune.md](docs/AUDIT-llama-autotune.md) | Audit of the prior-art project |
 | [CHANGELOG.md](CHANGELOG.md) | Changes |
-| [LICENSES.md](LICENSES.md) | Third-party licenses and attribution |
+| [LICENSE](LICENSE) · [LICENSES.md](LICENSES.md) | MIT; third-party notices |

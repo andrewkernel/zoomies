@@ -5,7 +5,7 @@ import PackageDescription
 //
 // ZoomiesKit holds everything that is not UI: hardware probes, GGUF inspection,
 // runtime adapters (llama.cpp first), the benchmark runner, statistics and
-// the SQLite result store. The `zoomies` CLI and (later) the SwiftUI app are
+// the SQLite result store. The `zoomies` CLI and the SwiftUI app are
 // thin front ends over it.
 let package = Package(
     name: "Zoomies",
@@ -13,6 +13,7 @@ let package = Package(
     products: [
         .library(name: "ZoomiesKit", targets: ["ZoomiesKit"]),
         .executable(name: "zoomies", targets: ["zoomies"]),
+        .executable(name: "ZoomiesApp", targets: ["ZoomiesApp"]),
     ],
     targets: [
         .target(
@@ -20,6 +21,8 @@ let package = Package(
             linkerSettings: [.linkedLibrary("sqlite3")]
         ),
         .executableTarget(name: "zoomies", dependencies: ["ZoomiesKit"]),
+        // The Mac app. scripts/build-app.sh wraps it into Zoomies.app.
+        .executableTarget(name: "ZoomiesApp", dependencies: ["ZoomiesKit"]),
         .testTarget(
             name: "ZoomiesKitTests",
             dependencies: ["ZoomiesKit"],

@@ -3,14 +3,15 @@
 ```
 ┌────────────────────┐   ┌────────────────────────┐
 │ zoomies CLI        │   │ Zoomies.app (SwiftUI)  │   front ends: no logic of their own
+│ Sources/zoomies    │   │ Sources/ZoomiesApp     │
 └─────────┬──────────┘   └───────────┬────────────┘
           └──────────────┬───────────┘
                     ZoomiesKit (Swift library)
  ┌──────────────┬──────────────┬───────────────┬──────────────┬─────────────┐
- │ Hardware     │ Model        │ Runtime       │ Bench        │ Store       │
- │ HardwareProbe│ GGUF reader  │ RuntimeAdapter│ Plan/Runner  │ SQLite      │
- │  Mac (now)   │ ModelInfo    │  llama.cpp ✓  │ Stats, CI    │ ResultStore │
- │  Linux/Win … │ KV estimate  │  MLX, Ollama …│ Comparison   │             │
+ │ Hardware     │ Model        │ Runtime       │ Bench / Tune │ Store       │
+ │ HardwareProbe│ GGUF reader  │ RuntimeAdapter│ Plan/Runner  │ SQLite v3   │
+ │  Mac (now)   │ ModelInfo    │  llama.cpp ✓  │ Stats, CI    │ runs, tunes │
+ │  Linux/Win … │ ModelLibrary │  MLX, Ollama …│ Tuner,Search │ profiles    │
  └──────────────┴──────────────┴───────┬───────┴──────┬───────┴─────────────┘
                                        │              │
                                 Process/ChildProcess (posix_spawn, process group,
@@ -30,6 +31,13 @@
 | `Process/ChildProcess.swift` | Runs a benchmark child via `posix_spawn` in its own process group, with default signal handling and only fds 0–2 inherited. stdout and stderr go to files, so the child can never block on a full pipe. Samples `proc_pid_rusage` v6 every 250 ms: the lifetime-max footprint (which excludes mmapped weights), resident size (which includes them), CPU time and `ri_energy_nj`. It also takes `ru_maxrss` from wait4. Timeout, Swift task cancellation, and guard callbacks stop the whole group with SIGTERM, then SIGKILL. `ChildRegistry` writes a pid file per child so the next start can stop orphans after a crash; it checks `proc_pidpath` first, so a reused pid is left alone. |
 | `Bench/BenchmarkRunner.swift` | `BenchmarkPlan` (seeded schedule with a shuffled order per round), preflight checks, the run loop with safety guards, aggregation and drift warnings. |
 | `Bench/Stats.swift` | Mean, standard deviation, median, MAD outliers (reported, never dropped), 95% t-intervals, and a Welch comparison with a relevance threshold. |
+| `Bench/ContextCost.swift` | Prompt and generation speed at several context depths in one process (`zoomies cost`). |
+| `Tune/TuneTypes.swift` | Objectives, budgets, dimensions, constraints, the tune report and decision, events. |
+| `Tune/SearchSpace.swift` | Which values of which settings are worth trying for this build, model, workload and machine, and why the others are skipped. |
+| `Tune/Tuner.swift` | The staged engine: screen (one-process sweeps, compared within the process), compose, narrow (successive halving against the defaults), verify (fresh paired rounds, relevance threshold, guardrail). |
+| `Tune/Profile.swift` | Saved profiles and `ServerCommand`, which turns a profile into a `llama-server` command that pins the defaults where llama-server and llama-bench differ. |
+| `Model/ModelLibrary.swift` | Finds GGUFs in common folders and Ollama's blob store; skips vision projectors and parts 2..N of split models. |
+| `Store/TuneStore.swift` | Tune runs, profiles and the append-only activation history behind apply and rollback. |
 | `Store/ResultStore.swift` | SQLite with versioned migrations. Queryable tables (`runs`, `trials`, `samples`, `summaries`), plus the full report as JSON so nothing is lost. |
 
 ## Key design decisions
@@ -41,8 +49,11 @@
 5. **Validate before spending GPU time.** Configs a build cannot run (missing flags, a quantized V cache without FA, a bad KV type) are blocked in preflight. Unwise ones, such as partial offload on unified memory, get a warning.
 6. **Never invent telemetry.** An unavailable value is `nil` with a reason. Derived numbers, such as the TTFT estimate, are named as derived everywhere they appear.
 
+## The app (`Sources/ZoomiesApp`)
+
+`AppModel` (`@Observable`, main actor) owns the state and calls ZoomiesKit. The tuner runs in a detached task; its events hop back to the main actor. Views: `RootView` (tabs, centre card, chips with floating menus anchored above them, a fixed-height result area so nothing shifts), `ResultViews` (live run, receipt with CI bars, details, profiles, history), `Theme`, and `AsciiField`. `AsciiField` renders the background swirl off the main thread into a reused alpha-only bitmap: per frame, all glyphs of a brightness band go to CoreText in one call. It drops to 6 fps while a tune runs, so the decoration never competes with the measurement. `scripts/build-app.sh` wraps the binary into an ad-hoc-signed `Zoomies.app` (and a DMG) with the Command Line Tools alone.
+
 ## Planned additions
 
-- **`Optimizer/`** (Phase 3): search-space builder per runtime and hardware; coarse screen, then successive halving, then an interleaved final duel; profile generation, rollback, and an objective/constraint model.
-- **`LlamaCpp/LlamaServerAdapter`**: real TTFT and end-to-end latency via `llama-server` streaming.
-- **`App/`** (Phase 5): SwiftUI front end. It subscribes to `BenchmarkEvent`, and the runner already runs off the main actor.
+- **`LlamaCpp/LlamaServerAdapter`**: real TTFT and end-to-end latency via `llama-server` streaming; A/B verification of profiles through the server.
+- **More runtimes** behind `RuntimeAdapter`: MLX, and Ollama as a runtime (Ollama's models are already found).

@@ -120,4 +120,25 @@ public struct Comparison: Codable, Sendable, Equatable {
         return Comparison(baselineMean: ma, candidateMean: mb, difference: d, ciLow: lo, ciHigh: hi,
                           degreesOfFreedom: df, verdict: verdict)
     }
+
+    /// Paired comparison from per-round ratios candidate/baseline (> 1 means the
+    /// candidate is better), measured in the same rounds. Pairing cancels drift
+    /// that hits both configs in a round, so it is more sensitive than Welch.
+    /// Computed on log-ratios; reported as relative change against a baseline of 1.
+    public static func pairedRatio(_ ratios: [Double], minRelevant: Double = 0.02) -> Comparison {
+        let logs = ratios.filter { $0 > 0 && $0.isFinite }.map { Foundation.log($0) }
+        let m = Stats.mean(logs)
+        guard logs.count >= 2 else {
+            return Comparison(baselineMean: 1, candidateMean: exp(m), difference: exp(m) - 1, ciLow: -.infinity,
+                              ciHigh: .infinity, degreesOfFreedom: 0, verdict: .insufficientData)
+        }
+        let df = Double(logs.count - 1)
+        let half = Stats.t95(df: df) * Stats.stddev(logs) / Double(logs.count).squareRoot()
+        let d = exp(m) - 1, lo = exp(m - half) - 1, hi = exp(m + half) - 1
+        let verdict: Verdict = if lo > 0 && d >= minRelevant { .faster }
+            else if hi < 0 && -d >= minRelevant { .slower }
+            else { .noDetectableDifference }
+        return Comparison(baselineMean: 1, candidateMean: exp(m), difference: d, ciLow: lo, ciHigh: hi,
+                          degreesOfFreedom: df, verdict: verdict)
+    }
 }

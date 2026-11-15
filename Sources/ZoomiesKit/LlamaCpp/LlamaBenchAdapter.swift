@@ -255,6 +255,78 @@ public struct LlamaBenchAdapter: RuntimeAdapter {
         return records
     }
 
+    // MARK: Tuning support
+
+    static func flag(for d: TuneDimension) -> String {
+        switch d {
+        case .flashAttention: "-fa"
+        case .ubatch: "-ub"
+        case .batch: "-b"
+        case .threads: "-t"
+        case .poll: "--poll"
+        case .kvCache: "-ctk"
+        case .gpuLayers: "-ngl"
+        }
+    }
+
+    /// "(default: 512)" in this build's --help line for the flag.
+    static func helpDefault(_ usageLine: String?) -> String? {
+        guard let line = usageLine, let r = line.range(of: #"\(default: ([^)]*)\)"#, options: .regularExpression) else { return nil }
+        let v = line[r].dropFirst("(default: ".count).dropLast().trimmingCharacters(in: .whitespaces)
+        return v.isEmpty ? nil : v
+    }
+
+    public func defaultValue(_ d: TuneDimension, installation inst: RuntimeInstallation) -> String? {
+        let f = Self.flag(for: d)
+        guard inst.flags.contains(f) else { return nil }
+        if let v = Self.helpDefault(inst.flagUsage[f]) { return v }
+        // Fallbacks for builds whose help omits a default (llama.cpp master as of 2026-11).
+        switch d {
+        case .flashAttention: return Self.choices(inst.flagUsage[f])?.contains("auto") == true ? "auto" : nil
+        case .ubatch: return "512"
+        case .batch: return "2048"
+        case .poll: return "50"
+        case .kvCache: return "f16"
+        case .gpuLayers: return "-1"
+        case .threads: return nil
+        }
+    }
+
+    /// llama-bench runs the cross product of comma-separated values in one
+    /// process, with the model loaded once. For the KV cache, K and V get the
+    /// same list; mixed pairs from the cross product are reported as "mixed".
+    public func sweepCommand(model: URL, dimension d: TuneDimension, values: [String], workload: Workload,
+                             repetitions: Int, installation inst: RuntimeInstallation) -> [String]? {
+        guard !values.isEmpty, inst.flags.contains(Self.flag(for: d)) else { return nil }
+        var a = benchmarkCommand(model: model, config: .runtimeDefaults, workload: workload,
+                                 repetitions: repetitions, installation: inst)
+        let list = values.joined(separator: ",")
+        a += [Self.flag(for: d), list]
+        if d == .kvCache { a += ["-ctv", list] }
+        return a
+    }
+
+    public func effectiveValue(_ d: TuneDimension, of m: TestMeasurement) -> String? {
+        let f = m.runtimeFields
+        switch d {
+        case .flashAttention:
+            switch f["flash_attn"] {
+            case "-1", "auto": return "auto"
+            case "0", "off", "false": return "off"
+            case "1", "on", "true": return "on"
+            default: return nil
+            }
+        case .ubatch: return f["n_ubatch"]
+        case .batch: return f["n_batch"]
+        case .threads: return f["n_threads"]
+        case .poll: return f["poll"]
+        case .gpuLayers: return f["n_gpu_layers"]
+        case .kvCache:
+            guard let k = f["type_k"], let v = f["type_v"] else { return nil }
+            return k == v ? k : "mixed:\(k)/\(v)"
+        }
+    }
+
     /// One JSON object per line. Log lines and unrelated JSON are ignored. A
     /// test with both n_prompt and n_gen (older builds, or -pg) counts as generation.
     static func parseJSONL(_ text: String) -> [TestMeasurement] {

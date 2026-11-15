@@ -13,7 +13,7 @@ public enum StoreError: Error, CustomStringConvertible {
 /// is ever lost to a schema that did not anticipate it.
 public final class ResultStore {
     private var db: OpaquePointer?
-    private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     public init(url: URL = AppPaths.database) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -26,7 +26,7 @@ public final class ResultStore {
 
     private var lastError: String { db.map { String(cString: sqlite3_errmsg($0)) } ?? "no database" }
 
-    private func exec(_ sql: String) throws {
+    func exec(_ sql: String) throws {
         guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw StoreError.sqlite(lastError) }
     }
 
@@ -116,6 +116,46 @@ public final class ResultStore {
             COMMIT;
             """)
         }
+        if userVersion() < 3 {
+            try exec("""
+            BEGIN;
+            CREATE TABLE tune_runs (
+              id TEXT PRIMARY KEY,
+              started_at REAL NOT NULL,
+              finished_at REAL NOT NULL,
+              hardware_fingerprint TEXT NOT NULL,
+              model_fingerprint TEXT NOT NULL,
+              model_path TEXT NOT NULL,
+              objective TEXT NOT NULL,
+              budget TEXT NOT NULL,
+              decision TEXT NOT NULL,
+              headline TEXT NOT NULL,
+              winner_json TEXT NOT NULL,
+              report_json TEXT NOT NULL
+            );
+            CREATE TABLE profiles (
+              id TEXT PRIMARY KEY,
+              created_at REAL NOT NULL,
+              model_fingerprint TEXT NOT NULL,
+              hardware_fingerprint TEXT NOT NULL,
+              name TEXT NOT NULL,
+              profile_json TEXT NOT NULL
+            );
+            -- Append-only: the active profile is the latest row; rollback appends the previous one.
+            -- profile_id NULL means "runtime defaults".
+            CREATE TABLE profile_activations (
+              seq INTEGER PRIMARY KEY AUTOINCREMENT,
+              model_fingerprint TEXT NOT NULL,
+              hardware_fingerprint TEXT NOT NULL,
+              profile_id TEXT,
+              activated_at REAL NOT NULL
+            );
+            CREATE INDEX tunes_by_model ON tune_runs(hardware_fingerprint, model_fingerprint, started_at);
+            CREATE INDEX profiles_by_model ON profiles(model_fingerprint, hardware_fingerprint);
+            PRAGMA user_version = 3;
+            COMMIT;
+            """)
+        }
     }
 
     // MARK: Writing
@@ -202,7 +242,7 @@ public final class ResultStore {
     }
 
     public func count(_ table: String) throws -> Int {
-        precondition(["runs", "trials", "samples", "summaries"].contains(table))
+        precondition(["runs", "trials", "samples", "summaries", "tune_runs", "profiles", "profile_activations"].contains(table))
         var n = 0
         try query("SELECT COUNT(*) FROM \(table)", []) { n = Int(sqlite3_column_int64($0, 0)) }
         return n
@@ -210,7 +250,7 @@ public final class ResultStore {
 
     // MARK: Plumbing
 
-    private func prepare(_ sql: String, _ args: [Any?]) throws -> OpaquePointer? {
+    func prepare(_ sql: String, _ args: [Any?]) throws -> OpaquePointer? {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw StoreError.sqlite(lastError) }
         for (i, a) in args.enumerated() {
@@ -227,13 +267,13 @@ public final class ResultStore {
         return stmt
     }
 
-    private func run(_ sql: String, _ args: [Any?]) throws {
+    func run(_ sql: String, _ args: [Any?]) throws {
         let stmt = try prepare(sql, args)
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.sqlite(lastError) }
     }
 
-    private func query(_ sql: String, _ args: [Any?], row: (OpaquePointer?) -> Void) throws {
+    func query(_ sql: String, _ args: [Any?], row: (OpaquePointer?) -> Void) throws {
         let stmt = try prepare(sql, args)
         defer { sqlite3_finalize(stmt) }
         while true {
@@ -242,7 +282,7 @@ public final class ResultStore {
         }
     }
 
-    private static func text(_ s: OpaquePointer?, _ i: Int32) -> String? {
+    static func text(_ s: OpaquePointer?, _ i: Int32) -> String? {
         guard let c = sqlite3_column_text(s, i) else { return nil }
         return String(cString: c)
     }

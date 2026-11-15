@@ -1,6 +1,6 @@
 # Third-party licenses and attribution
 
-Zoomies' own license has not been chosen yet. Decide this before the first public release.
+Zoomies is released under the MIT License (see [LICENSE](LICENSE)).
 
 ## Runtime dependencies
 

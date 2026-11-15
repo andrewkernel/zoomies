@@ -7,7 +7,7 @@
 - [x] Integration decision: an independent Swift implementation, with llama-autotune as reference and comparison baseline
 - [x] Smallest useful benchmark prototype: `zoomies probe / inspect / runtime / bench / history`, 26 tests
 
-## Phase 2: macOS benchmark foundation (next)
+## Phase 2: macOS benchmark foundation (mostly done)
 
 Prioritized backlog. **P0** blocks everything after it.
 
@@ -24,27 +24,36 @@ Prioritized backlog. **P0** blocks everything after it.
 | 7 | P1 | Periodic baseline re-measurement (from llama.cpp `tools/tuning`) with drift rejection | runner discards rounds that drift > threshold |
 | 8 | P2 | `llama-server` adapter for real TTFT and end-to-end latency | TTFT reported as measured, not derived |
 
-## Phase 3: optimization engine
+## Phase 3: optimization engine ✅ v1 (0.2.0)
 
-1. A search-space builder per runtime and hardware. On Metal it covers `fa`, `ub`/`b`, `ctk`/`ctv`, and `t`/`poll` (if Phase 2 shows they matter). It never covers `-C`, `--cpu-strict` or `--numa` on macOS. Partial `ngl` only when the model exceeds the working set.
-2. **Coarse screen:** one llama-bench process with comma lists, so the model loads once (llama-autotune's technique). Ranking only; it never decides on its own.
-3. **Successive halving:** survivors get more rounds, interleaved.
-4. **Final validation:** an interleaved duel against the defaults with CIs; the winner must be `faster`.
-5. Objectives: max generation, fastest response (TTFT), memory (smallest footprint with tg ≥ X% of the best), balanced (documented weights). Constraints: memory cap, time budget, minimum throughput, max thermal, battery allowed, context cap. Quantization and context are never changed silently.
-6. Profiles: save, export as `llama-server` args, keep the baseline profile, roll back.
-7. **Benchmark the optimizer:** compare against exhaustive grids on 2–3 models, and against llama-autotune `search` with equal benchmark budgets. Measure tuning time, evaluations, best config, validated throughput, repeatability and failure rate.
+- [x] Search-space builder per runtime, model and hardware (`SearchSpace`): fa, ub, b, KV type (opt-in), t, poll, partial ngl only when the model exceeds the GPU working set; never `-C`/`--cpu-strict`/`--numa` on macOS
+- [x] Coarse screen with llama-bench comma lists, compared inside one process; per-value fallback
+- [x] Successive halving, interleaved against the defaults
+- [x] Fresh-data verification with a paired per-round comparison, a 2% relevance threshold and a guardrail on the other metric
+- [x] Objectives: generation, response, balanced, memory. Budgets, time limit, seeds
+- [x] Profiles: save, apply, roll back, export as `llama-server` args; `zoomies serve`
+- [ ] Constraints: memory cap and minimum throughput as hard filters (the guardrail covers the common case)
+- [ ] **Benchmark the optimizer:** against exhaustive grids on 2–3 models, and against llama-autotune `search` at equal budgets (tuning time, evaluations, validated throughput, repeatability, failure rate)
+- [ ] Interaction screening (2-factor sweeps) on the thorough budget
 
 ## Phase 4: Apple Silicon performance engineering
 
 Depth sweeps (FA crossover), the KV-quantization cost/benefit curve, MoE models, and battery vs AC behaviour. If more Macs become available, compare MacBook Air against MacBook Pro cooling.
 
-## Phase 5: SwiftUI app
+## Phase 5: Mac app ✅ v1 (0.2.0)
 
-A native app on ZoomiesKit, organized around the flow select model → objective → constraints → optimize → results → apply/rollback. Dashboard, model library (references files, never copies them), live progress, and an advanced mode with logs. Note: a proper `.app` bundle and notarization need full Xcode; the dev Mac currently has only the Command Line Tools.
+- [x] One-window app: a centre card with model, context, goal and budget chips and a readiness chip; live stages; a receipt with CI bars; Apply, Undo and copying the server command; Profiles and History; Settings
+- [x] Model library (references files where they are; finds Ollama, LM Studio, llama.cpp and HF caches)
+- [x] App bundle and DMG built with the Command Line Tools only (ad-hoc signed)
+- [ ] Developer ID signing and notarization (needs the Apple Developer Program), Sparkle updates
+- [ ] "Advanced" view with raw logs and per-process tables
+- [ ] Launch and manage `llama-server` from the app
 
 ## Phase 6: runtime integration
 
-Launch `llama-server` with a validated profile, then verify the speedup with an A/B run.
+- [x] `zoomies serve`: start llama-server with the active profile, with defaults that differ from llama-bench pinned
+- [ ] A/B-verify the profile through llama-server itself (measured TTFT and end-to-end latency)
+- [ ] Context cost tooling (`zoomies cost`) as the baseline for context-reduction features (read gating, reranking)
 
 ## Phase 7: energy
 

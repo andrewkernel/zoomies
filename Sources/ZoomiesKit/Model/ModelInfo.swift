@@ -28,6 +28,9 @@ public struct ModelInfo: Codable, Sendable, Equatable {
     /// compute on every run. See `fullSHA256` for the exact hash.
     public var quickFingerprint: String
     public var fullSHA256: String?
+    /// For models split across files (`name-00001-of-00003.gguf`): the number of
+    /// parts. Sizes and tensor counts above cover all parts. nil for single files.
+    public var splitCount: Int? = nil
 
     public var isMoE: Bool { (expertCount ?? 0) > 1 }
 
@@ -49,7 +52,37 @@ public struct ModelInfo: Codable, Sendable, Equatable {
 public enum ModelInspector {
     public static func inspect(_ url: URL, fullHash: Bool = false) throws -> ModelInfo {
         let g = try GGUFFile.read(url)
-        return try summarize(g, url: url, fullHash: fullHash)
+        let count = g.metadata["split.count"]?.intValue ?? 1
+        guard count > 1 else { return try summarize(g, url: url, fullHash: fullHash) }
+        // Split model: llama.cpp loads every part from the first one, so memory
+        // checks must count all of them.
+        let parts = try splitParts(of: url, count: count)
+        var merged = g
+        for part in parts.dropFirst() {
+            let pg = try GGUFFile.read(part)
+            merged.tensors += pg.tensors
+            merged.fileSize += pg.fileSize
+        }
+        var info = try summarize(merged, url: parts[0], fullHash: fullHash)
+        info.splitCount = count
+        return info
+    }
+
+    /// All parts of a split model, given any one of them. Throws if a part is missing.
+    public static func splitParts(of url: URL, count: Int) throws -> [URL] {
+        let name = url.lastPathComponent
+        guard let r = name.range(of: #"-\d{5}-of-\d{5}\.gguf$"#, options: .regularExpression) else {
+            throw GGUFError.invalid("split model, but '\(name)' does not follow the name-00001-of-0000N.gguf pattern")
+        }
+        let stem = String(name[..<r.lowerBound])
+        let dir = url.deletingLastPathComponent()
+        return try (1...count).map { i in
+            let part = dir.appendingPathComponent(String(format: "%@-%05d-of-%05d.gguf", stem, i, count))
+            guard FileManager.default.fileExists(atPath: part.path) else {
+                throw GGUFError.invalid("split model part \(i) of \(count) is missing: \(part.lastPathComponent)")
+            }
+            return part
+        }
     }
 
     static func summarize(_ g: GGUFFile, url: URL, fullHash: Bool) throws -> ModelInfo {

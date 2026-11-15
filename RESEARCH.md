@@ -98,15 +98,24 @@ MacBook Pro Mac17,2 (M5, 4 Super + 6 Efficiency cores, 10-core GPU, 16 GB), macO
 - **One-time Metal compile after install** [M]. The first llama.cpp process compiled 36 Metal libraries in about 5 s. Later processes load them in about 13 ms. llama-bench excludes this from tokens/s, but it inflates the first process's wall time after an install or upgrade.
 - **"auto" settings are not resolved in the output** [M]. The JSONL reports `flash_attn: -1` and `load_mode: "auto"`, not what auto chose. Whether the baseline ran with FA on needs verbose logs (open question 8).
 - **Noise floor** [M]: 10 rounds × 5 repetitions of the defaults (pp512, tg128). pp 3074.5 t/s, 95% CI ±6.4%; tg 99.1 t/s, CI ±3.4%. Round 7 was disturbed (one pp repetition at 945 t/s, round mean −27%). Without that round the CIs would be ±1.9% (pp) and ±2.2% (tg). The official result keeps it. Since this run, Zoomies flags disturbed rounds automatically.
+- **Tuning results, 1.5B model, prompt-heavy workload (pp2048)** [M] (BENCHMARKS.md §3):
+  - **Flash attention:** `fa=auto` already picks the fast path. Forcing it off costs about 8% of prompt speed (and about 7% of generation speed in a pp512/tg128 run).
+  - **Micro-batch:** larger is *slower* on this setup. `ub=2048` was 8.5% slower than the default 512, and `ub=1024` 3.6% slower.
+  - **Threads and polling:** with full GPU offload they barely matter, and every non-default value was slightly slower.
+  - Net result: the defaults were verified as best (the top candidate was +0.3% [−1.7%, +2.3%]).
+- **14B: a smaller micro-batch is faster for prompts** [M]. On Qwen3-14B Q4_K_M with a 2,048-token prompt, `-ub 256` gave **+11.5% prompt speed [+6.2%, +17.0%]** over the default 512 (verified on fresh paired rounds), with no change in generation speed. Larger values were much worse: 1024 −15%, 2048 −23%. The cause is unknown (hypotheses [H]: Metal kernel tiling or the tensor-API path favouring smaller tiles, L2/SLC working-set size, or compute-buffer pressure on a 16 GB machine). Open question 9.
+- **Quiet machine, low noise** [M]. With browsers and chat apps closed, the default prompt speed varied by about 0.3% across six verification rounds. Background apps, not the hardware, set most of the noise floor measured earlier.
+- **Loading a 14B model spikes memory pressure** [M]. Mapping Qwen3-14B Q4_K_M (8.4 GiB) on the 16 GB Mac made macOS report *critical* pressure for a moment while it evicted file cache; a minute later it was normal, with 8+ GiB free. The guard now requires critical pressure to last 5 s before stopping. Sustained pressure and real swapping (more than 1 GiB) still stop a run.
 - **Consequence:** under these conditions, 10 rounds can detect differences of roughly 3–6%. The 2% relevance threshold only binds on a quieter machine. Re-measure with other apps closed.
 
 ## Open questions (next experiments)
 
 1. ~~Does `phys_footprint` include Metal buffers?~~ Partly answered [M]: it excludes mmapped weights. Still to do: validate footprint and RSS against `footprint`/`vmmap` with a 4+ GB model.
 2. ~~What is the noise floor?~~ Measured under memory pressure [M] (above). Repeat on an idle machine.
-3. Does `-t` (1, 2, 4, 10) or `--poll` (0, 50) change tg or pp with full offload, or only CPU power?
+3. ~~Does `-t` or `--poll` matter with full offload?~~ Not for speed on the 1.5B model [M]: every non-default value was 1–4% slower. CPU power is still unmeasured.
 4. What does the `-ub` sweep (128 to 2,048) do to pp on Metal at depth 0 and at depth 8,192?
 5. What is the `-fa on` vs `off` crossover depth on the M5?
 6. How much pp and tg do q8_0 and q4_0 KV caches cost against the memory they save?
 7. Does the 180 s residency keep-alive bias the first run of a round?
+9. Why is `-ub 256` faster than 512 for prompts on the M5 with a 14B model, and does it hold for other sizes, quantizations, and on M1–M4? (A sweep of 128/256/384/512 across models would answer it.)
 8. What does `-fa auto` resolve to on Metal for this model? Run `llama-bench -v` and read the context log.
