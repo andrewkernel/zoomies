@@ -53,4 +53,4 @@ esac
 if ! command -v llama-bench >/dev/null 2>&1 && [ ! -x /opt/homebrew/bin/llama-bench ]; then
   say "Zoomies tunes llama.cpp, which isn't installed yet:  brew install llama.cpp"
 fi
-say "Done. Try:  zoomies models   or open Zoomies from ~/Applications"
+say "Done. Try:  zoomies models$( [ -z "${ZOOMIES_NO_APP:-}" ] && printf "   or open %s/Zoomies.app" "$APPS" )"
